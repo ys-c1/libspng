@@ -1663,6 +1663,65 @@ static int32_t filter_sum(const unsigned char *prev_scanline, const unsigned cha
     return sum;
 }
 
+/* Fused variant of filter_sum(): evaluates the absolute-residual score for
+   every enabled filter in a single scan of the row, so an adaptive row that
+   chooses among N filters touches the input once instead of N times.
+   scores[i] is only written when the corresponding SPNG_FILTER_CHOICE_* bit
+   is present in "choices"; other entries are left untouched.
+   Returns 1 on the (pathological) size overflow guard, 0 on success. */
+static int filter_sum_multi(const unsigned char *prev_scanline, const unsigned char *scanline,
+                            size_t size, unsigned bytes_per_pixel, const int choices,
+                            int32_t scores[5])
+{
+    /* prevent potential over/underflow, bails out at a width of ~8M pixels for RGBA8 */
+    if(size > (INT32_MAX / 128)) return 1;
+
+    const int want_none   = choices & SPNG_FILTER_CHOICE_NONE;
+    const int want_sub    = choices & SPNG_FILTER_CHOICE_SUB;
+    const int want_up     = choices & SPNG_FILTER_CHOICE_UP;
+    const int want_avg    = choices & SPNG_FILTER_CHOICE_AVG;
+    const int want_paeth  = choices & SPNG_FILTER_CHOICE_PAETH;
+
+    int32_t sum_none = 0, sum_sub = 0, sum_up = 0, sum_avg = 0, sum_paeth = 0;
+
+    uint32_t i;
+    for(i=0; i < size; i++)
+    {
+        uint8_t a, b, c;
+
+        if(i >= bytes_per_pixel)
+        {
+            a = scanline[i - bytes_per_pixel];
+            b = prev_scanline[i];
+            c = prev_scanline[i - bytes_per_pixel];
+        }
+        else /* first pixel in row */
+        {
+            a = 0;
+            b = prev_scanline[i];
+            c = 0;
+        }
+
+        const uint8_t x = scanline[i];
+
+        /* Each residual is computed independently from raw samples, exactly
+           as filter_sum() does; sharing the byte loads is the only change. */
+        if(want_none)  sum_none  += 128 - abs((int)x - 128);
+        if(want_sub)   sum_sub   += 128 - abs((int)(uint8_t)(x - a) - 128);
+        if(want_up)    sum_up    += 128 - abs((int)(uint8_t)(x - b) - 128);
+        if(want_avg)   sum_avg   += 128 - abs((int)(uint8_t)(x - (uint8_t)((a + b) / 2)) - 128);
+        if(want_paeth) sum_paeth += 128 - abs((int)(uint8_t)(x - paeth(a,b,c)) - 128);
+    }
+
+    if(want_none)  scores[SPNG_FILTER_NONE]    = sum_none;
+    if(want_sub)   scores[SPNG_FILTER_SUB]     = sum_sub;
+    if(want_up)    scores[SPNG_FILTER_UP]      = sum_up;
+    if(want_avg)   scores[SPNG_FILTER_AVERAGE] = sum_avg;
+    if(want_paeth) scores[SPNG_FILTER_PAETH]   = sum_paeth;
+
+    return 0;
+}
+
 static unsigned get_best_filter(const unsigned char *prev_scanline, const unsigned char *scanline,
                                 size_t scanline_width, unsigned bytes_per_pixel, const int choices)
 {
@@ -1684,15 +1743,32 @@ static unsigned get_best_filter(const unsigned char *prev_scanline, const unsign
         }
     }
 
+    /* Single-scan path: one pass over the row computes every enabled
+       filter's residual score. On the overflow guard fall back to the
+       original per-filter evaluation so results stay identical. */
+    if(filter_sum_multi(prev_scanline, scanline, scanline_width,
+                        bytes_per_pixel, choices, filter_scores))
+    {
+        for(i=0; i < 5; i++)
+        {
+            flag = 1 << (i + 3);
+
+            if(choices & flag) sum = filter_sum(prev_scanline, scanline, scanline_width, bytes_per_pixel, i);
+            else continue;
+
+            filter_scores[i] = abs(sum);
+        }
+    }
+    else
+    {
+        for(i=0; i < 5; i++)
+        {
+            if(choices & (1 << (i + 3))) filter_scores[i] = abs(filter_scores[i]);
+        }
+    }
+
     for(i=0; i < 5; i++)
     {
-        flag = 1 << (i + 3);
-
-        if(choices & flag) sum = filter_sum(prev_scanline, scanline, scanline_width, bytes_per_pixel, i);
-        else continue;
-
-        filter_scores[i] = abs(sum);
-
         if(filter_scores[i] < best_score)
         {
             best_score = filter_scores[i];
